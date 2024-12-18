@@ -17,6 +17,8 @@
 package allocate
 
 import (
+	"fmt"
+	"math"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -176,7 +178,17 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 		klog.V(3).Infof("Try to allocate resource to %d tasks of Job <%v/%v>",
 			tasks.Len(), job.Namespace, job.Name)
 
-		alloc.allocateResourcesForTasks(tasks, job, jobs, queue, allNodes)
+		var enableOptimizeSched bool
+		allocateArgs := framework.GetArgOfActionFromConf(alloc.session.Configurations, alloc.Name())
+		allocateArgs.GetBool(&enableOptimizeSched, "enableOptimizeSched")
+
+		if enableOptimizeSched {
+			klog.V(3).Infof("queue %+v  job %s enter optimizeAllocateResForTasks...", queue.UID, job.Name)
+			alloc.optimizeAllocateResForTasks(tasks, job, jobs, queue, allNodes)
+		} else {
+			klog.V(3).Infof("queue %+v job %s enter allocateResourcesForTasks...", queue.UID, job.Name)
+			alloc.allocateResourcesForTasks(tasks, job, jobs, queue, allNodes)
+		}
 
 		// Put back the queue to priority queue after job's resource allocating finished,
 		// To ensure that the priority of the queue is calculated based on the latest resource allocation situation.
@@ -327,6 +339,154 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 	}
 }
 
+func (alloc *Action) optimizeAllocateResForTasks(tasks *util.PriorityQueue, job *api.JobInfo, jobs *util.PriorityQueue, queue *api.QueueInfo, allNodes []*api.NodeInfo) {
+	ssn := alloc.session
+	stmt := framework.NewStatement(ssn)
+	ph := util.NewPredicateHelper()
+
+	groupTasks := map[string][]*api.TaskInfo{}
+	for !tasks.Empty() {
+		task := tasks.Pop().(*api.TaskInfo)
+		replicaType := task.ReplicaType
+		klog.V(5).Infof("add task %s to replicaType %s",
+			task.Name, replicaType)
+		groupTasks[replicaType] = append(groupTasks[replicaType], task)
+	}
+
+	for replicaType, tasks := range groupTasks {
+		taskNum := len(tasks)
+		if taskNum == 0 {
+			continue
+		}
+
+		klog.V(3).Infof("Try to allocate resource to replicaType %s %d tasks of Job <%v/%v>",
+			replicaType, taskNum, job.Namespace, job.Name)
+
+		firstTask := tasks[0]
+		totalResreqTask := firstTask.Clone()
+		totalResreqTask.Resreq = totalResreqTask.Resreq.Multi(float64(taskNum))
+		totalResreqTask.Name = fmt.Sprintf("%s-%s-%d", job.Name, replicaType, taskNum)
+
+		if !ssn.Allocatable(queue, totalResreqTask) {
+			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, totalResreqTask.Name)
+			break
+		}
+
+		klog.V(3).Infof("There are <%d> nodes for Job <%v/%v> replicaType %s", len(ssn.Nodes), job.Namespace, job.Name, replicaType)
+
+		baseTask := firstTask.Clone()
+		if err := ssn.PrePredicateFn(baseTask); err != nil {
+			klog.V(3).Infof("PrePredicate for task %s/%s failed for: %v", baseTask.Namespace, baseTask.Name, err)
+			fitErrors := api.NewFitErrors()
+			for _, ni := range allNodes {
+				fitErrors.SetNodeError(ni.Name, err)
+			}
+			job.NodesFitErrors[baseTask.UID] = fitErrors
+			break
+		}
+
+		predicateNodes, fitErrors := ph.PredicateNodes(baseTask, allNodes, alloc.predicate, true)
+		if len(predicateNodes) == 0 {
+			job.NodesFitErrors[baseTask.UID] = fitErrors
+			break
+		}
+
+		klog.V(3).Infof("predicateNodes for Job <%v/%v> base task, len=%d", job.Namespace, job.Name, len(predicateNodes))
+		var candidateNodes []*api.NodeInfo
+		var satisfyTotalNum int
+		for _, n := range predicateNodes {
+			if baseTask.InitResreq.LessEqual(n.Idle, api.Zero) || baseTask.InitResreq.LessEqual(n.FutureIdle(), api.Zero) {
+				candidateNodes = append(candidateNodes, n)
+				nodeSatisfyNum := getNodeSatisfyNum(n.Idle, n.FutureIdle(), baseTask)
+				satisfyTotalNum += nodeSatisfyNum
+			}
+		}
+
+		if taskNum > satisfyTotalNum || len(candidateNodes) == 0 {
+			klog.V(3).Infof("replicaType %s node num %d not satisfy of  Job <%v/%v>",
+				replicaType, satisfyTotalNum, job.Namespace, job.Name)
+			break
+		}
+
+		// Init topK
+		var nodeScores map[float64][]*api.NodeInfo
+		if len(candidateNodes) == 1 {
+			nodeScores = map[float64][]*api.NodeInfo{
+				float64(1000): []*api.NodeInfo{candidateNodes[0]},
+			}
+		} else {
+			nodeScores = util.PrioritizeNodes(baseTask, candidateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+		}
+
+		cap := math.Min(float64(taskNum), float64(len(candidateNodes)))
+		topK := util.NewTopK(int(cap))
+		for score, nodes := range nodeScores {
+			for _, node := range nodes {
+				sn := util.ScoreNode{score, node}
+				topK.Add(sn)
+			}
+		}
+
+		// Assign tasks in turn to the node with the highest score in topK
+		for taskIdx := 0; taskIdx < taskNum; taskIdx++ {
+			bestScoreNode, exist := topK.GetTopK()
+			if !exist {
+				break
+			}
+
+			bestNode := bestScoreNode.Node
+			curTask := tasks[taskIdx]
+			klog.V(3).Infof("select task <%s/%s> on node <%s> score is %d",
+				curTask.Namespace, curTask.Name, bestNode.Name, bestScoreNode.Score)
+			if curTask.InitResreq.LessEqual(bestNode.Idle, api.Zero) {
+				klog.V(3).Infof("Binding Task <%v/%v> to node <%v>",
+					curTask.Namespace, curTask.Name, bestNode.Name)
+
+				if err := stmt.Allocate(curTask, bestNode); err != nil {
+					klog.Errorf("Failed to bind Task %v on %v in Session %v, err: %v",
+						curTask.UID, bestNode.Name, ssn.UID, err)
+				} else {
+					metrics.UpdateE2eSchedulingDurationByJob(job.Name, string(job.Queue), job.Namespace, metrics.Duration(job.CreationTimestamp.Time))
+					metrics.UpdateE2eSchedulingLastTimeByJob(job.Name, string(job.Queue), job.Namespace, time.Now())
+				}
+			} else {
+				klog.V(3).Infof("Predicates failed in allocate for task <%s/%s> on node <%s> with limited resources",
+					curTask.Namespace, curTask.Name, bestNode.Name)
+
+				// Allocate releasing resource to the task if any.
+				if curTask.InitResreq.LessEqual(bestNode.FutureIdle(), api.Zero) {
+					klog.V(3).Infof("Pipelining Task <%v/%v> to node <%v> for <%v> on <%v>",
+						curTask.Namespace, curTask.Name, bestNode.Name, curTask.InitResreq, bestNode.Releasing)
+					if err := stmt.Pipeline(curTask, bestNode.Name, false); err != nil {
+						klog.Errorf("Failed to pipeline Task %v on %v in Session %v for %v.",
+							curTask.UID, bestNode.Name, ssn.UID, err)
+					} else {
+						metrics.UpdateE2eSchedulingDurationByJob(job.Name, string(job.Queue), job.Namespace, metrics.Duration(job.CreationTimestamp.Time))
+						metrics.UpdateE2eSchedulingLastTimeByJob(job.Name, string(job.Queue), job.Namespace, time.Now())
+					}
+				}
+			}
+
+			// Check whether the remaining resources of the node are sufficient
+			if taskIdx < taskNum-1 && (baseTask.InitResreq.LessEqual(bestNode.Idle, api.Zero) || baseTask.InitResreq.LessEqual(bestNode.FutureIdle(), api.Zero)) {
+				nodeScore := util.PrioritizeNode(baseTask, bestNode, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+
+				klog.V(3).Infof("rePrioritize task <%s/%s> on node <%s> score is %d",
+					curTask.Namespace, curTask.Name, bestNode.Name, nodeScore)
+				topK.Add(util.ScoreNode{nodeScore, bestNode})
+			}
+		}
+	}
+
+	if ssn.JobReady(job) {
+		stmt.Commit()
+	} else {
+		if !ssn.JobPipelined(job) {
+			stmt.Discard()
+		}
+	}
+}
+
 func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 	// Check for Resource Predicate
 	var statusSets api.StatusSets
@@ -338,3 +498,22 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 }
 
 func (alloc *Action) UnInitialize() {}
+
+func getNodeSatisfyNum(idle *api.Resource, futureIdle *api.Resource, task *api.TaskInfo) int {
+	resreq := task.InitResreq
+	var avail *api.Resource
+	var count int
+
+	if resreq.LessEqual(idle, api.Zero) {
+		avail = idle.Clone()
+	} else {
+		avail = futureIdle.Clone()
+	}
+
+	for resreq.LessEqual(avail, api.Zero) {
+		count += 1
+		avail.Sub(resreq)
+	}
+
+	return count
+}

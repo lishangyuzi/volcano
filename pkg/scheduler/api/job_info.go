@@ -142,6 +142,8 @@ type TaskInfo struct {
 	CustomBindErrHandler func() error `json:"-"`
 	// CustomBindErrHandlerSucceeded indicates whether CustomBindErrHandler is executed successfully.
 	CustomBindErrHandlerSucceeded bool
+
+	ReplicaType string
 }
 
 func getJobID(pod *v1.Pod) JobID {
@@ -170,6 +172,7 @@ func getTaskRole(pod *v1.Pod) string {
 }
 
 const TaskPriorityAnnotation = "volcano.sh/task-priority"
+const ReplicaTypeLabel = "volcano.sh/replica-type"
 
 // NewTaskInfo creates new taskInfo object for a Pod
 func NewTaskInfo(pod *v1.Pod) *TaskInfo {
@@ -215,6 +218,10 @@ func NewTaskInfo(pod *v1.Pod) *TaskInfo {
 		if priority, err := strconv.ParseInt(taskPriority, 10, 32); err == nil {
 			ti.Priority = int32(priority)
 		}
+	}
+
+	if replicaType, ok := pod.Labels[ReplicaTypeLabel]; ok && replicaType != "" {
+		ti.ReplicaType = replicaType
 	}
 
 	return ti
@@ -294,6 +301,7 @@ func (ti *TaskInfo) Clone() *TaskInfo {
 			Status:   ti.Status,
 		},
 		LastTransaction: ti.LastTransaction.Clone(),
+		ReplicaType:     ti.ReplicaType,
 	}
 }
 

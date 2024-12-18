@@ -126,6 +126,57 @@ func PrioritizeNodes(task *api.TaskInfo, nodes []*api.NodeInfo, batchFn api.Batc
 	return nodeScores
 }
 
+// PrioritizeNode returns single node's score
+func PrioritizeNode(task *api.TaskInfo, node *api.NodeInfo, batchFn api.BatchNodeOrderFn, mapFn api.NodeOrderMapFn, reduceFn api.NodeOrderReduceFn) float64 {
+	pluginNodeScoreMap := map[string]k8sframework.NodeScoreList{}
+	nodeOrderScoreMap := map[string]float64{}
+
+	mapScores, orderScore, err := mapFn(task, node)
+	if err != nil {
+		klog.Errorf("Error in Calculating Priority for the node:%v", err)
+		return -1
+	}
+
+	for plugin, score := range mapScores {
+		nodeScoreList, ok := pluginNodeScoreMap[plugin]
+		if !ok {
+			nodeScoreList = k8sframework.NodeScoreList{}
+		}
+		hp := k8sframework.NodeScore{}
+		hp.Name = node.Name
+		hp.Score = int64(math.Floor(score))
+		pluginNodeScoreMap[plugin] = append(nodeScoreList, hp)
+	}
+
+	nodeOrderScoreMap[node.Name] = orderScore
+
+	reduceScores, err := reduceFn(task, pluginNodeScoreMap)
+	if err != nil {
+		klog.Errorf("Error in Calculating Priority for the node:%v", err)
+		return -1
+	}
+
+	batchNodeScore, err := batchFn(task, []*api.NodeInfo{node})
+	if err != nil {
+		klog.Errorf("Error in Calculating batch Priority for the node, err %v", err)
+		return -1
+	}
+
+	// If no plugin is applied to this node, the default is 0.0
+	score := 0.0
+	if reduceScore, ok := reduceScores[node.Name]; ok {
+		score += reduceScore
+	}
+	if orderScore, ok := nodeOrderScoreMap[node.Name]; ok {
+		score += orderScore
+	}
+	if batchScore, ok := batchNodeScore[node.Name]; ok {
+		score += batchScore
+	}
+
+	return score
+}
+
 // SortNodes returns nodes by order of score
 func SortNodes(nodeScores map[float64][]*api.NodeInfo) []*api.NodeInfo {
 	var nodesInorder []*api.NodeInfo
